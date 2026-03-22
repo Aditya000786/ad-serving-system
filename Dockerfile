@@ -5,6 +5,8 @@ COPY pom.xml .
 COPY ad-server-core/pom.xml ad-server-core/
 COPY ad-server-api/pom.xml ad-server-api/
 COPY targeting-engine/pom.xml targeting-engine/
+COPY budget-manager/pom.xml budget-manager/
+COPY event-processor/pom.xml event-processor/
 RUN mvn dependency:go-offline -B
 COPY . .
 RUN mvn clean package -DskipTests -B
