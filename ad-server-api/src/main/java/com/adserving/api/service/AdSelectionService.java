@@ -4,15 +4,15 @@ import com.adserving.core.auction.AdRanker;
 import com.adserving.core.model.*;
 import com.adserving.core.port.AdIndexPort;
 import com.adserving.core.port.AdRepository;
+import com.adserving.core.port.BudgetPort;
+import com.adserving.core.port.EventPort;
 import com.adserving.targeting.TargetingEvaluator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.util.Comparator;
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
+import java.time.Instant;
+import java.util.*;
 
 @Service
 public class AdSelectionService {
@@ -24,17 +24,23 @@ public class AdSelectionService {
     private final TargetingEvaluator targetingEvaluator;
     private final AdRanker adRanker;
     private final TrackTokenService trackTokenService;
+    private final BudgetPort budgetPort;
+    private final EventPort eventPort;
 
     public AdSelectionService(AdIndexPort adIndex,
                               AdRepository adRepository,
                               TargetingEvaluator targetingEvaluator,
                               AdRanker adRanker,
-                              TrackTokenService trackTokenService) {
+                              TrackTokenService trackTokenService,
+                              BudgetPort budgetPort,
+                              EventPort eventPort) {
         this.adIndex = adIndex;
         this.adRepository = adRepository;
         this.targetingEvaluator = targetingEvaluator;
         this.adRanker = adRanker;
         this.trackTokenService = trackTokenService;
+        this.budgetPort = budgetPort;
+        this.eventPort = eventPort;
     }
 
     public Optional<AdResponse> selectAd(AdRequest request) {
@@ -64,9 +70,34 @@ public class AdSelectionService {
             return Optional.empty();
         }
 
-        // 4. Score and rank
+        // 4. Filter by budget availability
+        List<Ad> withBudget = targeted.stream()
+                .filter(ad -> budgetPort.hasRemainingBudget(ad.getCampaignId()))
+                .toList();
+
+        if (withBudget.isEmpty()) {
+            log.debug("All eligible ads have exhausted budgets");
+            return Optional.empty();
+        }
+
+        // 5. Apply pacing — probabilistic throttle based on pacing multiplier
+        List<Ad> paced = new ArrayList<>();
+        Random rand = new Random();
+        for (Ad ad : withBudget) {
+            double multiplier = budgetPort.getPacingMultiplier(ad.getCampaignId());
+            if (multiplier >= 1.0 || rand.nextDouble() < multiplier) {
+                paced.add(ad);
+            }
+        }
+
+        if (paced.isEmpty()) {
+            // If pacing filtered all, fall back to withBudget to avoid zero-serving
+            paced = withBudget;
+        }
+
+        // 6. Score and rank
         record ScoredAd(Ad ad, double score) {}
-        List<ScoredAd> scored = targeted.stream()
+        List<ScoredAd> scored = paced.stream()
                 .map(ad -> new ScoredAd(ad, adRanker.score(ad, request)))
                 .sorted(Comparator.comparingDouble(ScoredAd::score).reversed())
                 .toList();
@@ -74,7 +105,7 @@ public class AdSelectionService {
         ScoredAd winner = scored.getFirst();
         Ad winnerAd = winner.ad();
 
-        // 5. Calculate price (simplified for Phase 1 — full GSP in Phase 3)
+        // 7. Calculate price (GSP second-price)
         double pricePaidCents;
         if (scored.size() > 1) {
             pricePaidCents = scored.get(1).score() / 0.01 + 1; // second price + $0.01
@@ -82,14 +113,35 @@ public class AdSelectionService {
             pricePaidCents = winnerAd.getBidAmountCents() * 0.5; // floor price
         }
 
-        // 6. Generate track token
+        // 8. Atomic budget deduction (charge at serve time)
+        long costCents = Math.round(pricePaidCents);
+        if (!budgetPort.deductBudget(winnerAd.getCampaignId(), costCents)) {
+            log.debug("Budget deduction failed for campaign {}", winnerAd.getCampaignId());
+            return Optional.empty();
+        }
+
+        // 9. Generate track token
         String trackToken = trackTokenService.generateToken(
                 winnerAd.getId(),
                 winnerAd.getCampaignId(),
                 request.getUserId(),
                 request.getGeo());
 
-        // 7. Build response
+        // 10. Publish impression event (async, fire-and-forget)
+        eventPort.publishEvent(AdEvent.builder()
+                .eventId(UUID.randomUUID().toString())
+                .type(EventType.IMPRESSION)
+                .adId(winnerAd.getId())
+                .campaignId(winnerAd.getCampaignId())
+                .userId(request.getUserId())
+                .timestamp(Instant.now())
+                .context(EventContext.builder()
+                        .geo(request.getGeo())
+                        .device(request.getDevice())
+                        .build())
+                .build());
+
+        // 11. Build response
         AdResponse response = AdResponse.builder()
                 .adId(winnerAd.getId())
                 .title(winnerAd.getTitle())
