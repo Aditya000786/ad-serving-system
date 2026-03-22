@@ -1,55 +1,6 @@
 # Ad Serving System
 
-Real-time ad serving platform built with Java 21 and Spring Boot. Handles ad selection through a multi-stage pipeline: Redis-backed candidate retrieval, multi-dimensional targeting, budget-aware pacing, second-price auction ranking, and atomic budget deduction — all in a single request path.
-
-## Architecture
-
-```
-                    ┌─────────────┐
-   GET /v1/ad ────▶ │  API Layer  │
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-        ┌──────────┐ ┌──────────┐ ┌──────────┐
-        │  Redis   │ │Targeting │ │  Budget  │
-        │  Index   │ │  Engine  │ │ Manager  │
-        └──────────┘ └──────────┘ └──────────┘
-              │            │            │
-              └────────────┼────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │   Auction   │
-                    │  (GSP/2nd)  │
-                    └──────┬──────┘
-                           ▼
-                    ┌─────────────┐
-                    │   Kafka     │
-                    │  Events     │
-                    └─────────────┘
-```
-
-**Modules:**
-
-| Module | Purpose |
-|--------|---------|
-| `ad-server-core` | Domain models, ports, targeting matcher interfaces |
-| `ad-server-api` | Spring Boot app — controllers, Redis index, JPA adapters |
-| `targeting-engine` | Geo, device, contextual, and daypart targeting matchers |
-| `budget-manager` | Redis-based atomic budget deduction with Lua scripts, pacing |
-| `event-processor` | Kafka consumer, deduplication, reporting aggregation |
-
-## Ad Selection Pipeline
-
-Each request flows through these stages:
-
-1. **Candidate retrieval** — query Redis index for eligible ad IDs matching request parameters
-2. **Targeting evaluation** — filter candidates through geo, device, contextual, and daypart matchers
-3. **Budget check** — verify campaign has remaining daily budget
-4. **Pacing** — probabilistic throttle based on spend-vs-time pacing multiplier
-5. **Auction** — score candidates, rank, apply GSP second-price pricing
-6. **Budget deduction** — atomic Redis decrement via Lua script (race-condition safe)
-7. **Event publishing** — fire impression event to Kafka (async, non-blocking)
+A production-grade ad serving system in Java demonstrating real-time ad selection, auction mechanics, budget management with pacing, event processing, and reporting. Built with the same stack used at Google Ads and Uber Ad Serving.
 
 ## Quick Start
 
@@ -60,63 +11,141 @@ Each request flows through these stages:
 docker-compose up -d
 
 # Verify the app is running
-curl http://localhost:8080/v1/ad?geo=US&city=new_york&category=sports&device=mobile
+curl "http://localhost:8080/v1/ad?geo=US&city=new_york&category=sports&device=mobile"
 ```
 
-The app auto-seeds sample campaigns, ad groups, and ads on startup via Flyway migrations and data warmers.
+The system auto-seeds **50 campaigns, 200 ad groups, and 500 ads** with realistic targeting data on first startup.
 
-## API Endpoints
+### Try it
 
-### Ad Selection
-```
-GET /v1/ad?geo={geo}&city={city}&category={category}&device={device}&user_id={userId}
-```
-Returns the winning ad with creative URL, click/impression tracking URLs, and auction metadata.
+```bash
+# Get an ad
+curl "http://localhost:8080/v1/ad?geo=IN&category=finance&device=DESKTOP&user_id=u123"
 
-### Event Tracking
-```
-GET  /v1/click?ad={adId}&track={token}       # Click redirect (302)
-GET  /v1/impression?ad={adId}&track={token}   # Impression pixel
-POST /v1/events                                # Raw event ingestion
-```
+# Click redirect
+curl -v "http://localhost:8080/v1/click?ad=<ad_id>&track=<track_token>"
 
-### Reporting
-```
-GET /v1/reports/campaign/{id}?from={date}&to={date}&granularity={HOURLY|DAILY}
-GET /v1/reports/campaign/{id}/realtime
+# Post an event
+curl -X POST "http://localhost:8080/v1/events" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"CLICK","adId":"ad_456","campaignId":"camp_789"}'
+
+# Real-time stats
+curl "http://localhost:8080/v1/reports/campaign/<campaign_id>/realtime"
 ```
 
-## Load Test Results
-
-Tested with [k6](https://k6.io/) using `ramping-arrival-rate` to sustain high throughput. The test ramps from 100 to 10,000 RPS over 90 seconds, then sustains peak load for 2 minutes.
+## Architecture
 
 ```
+Ad Request ──▶ Targeting Engine ──▶ Budget Check ──▶ Auction ──▶ Ad Response
+                    │                    │              │
+                    ▼                    ▼              ▼
+               Redis Index         Redis Lua       Kafka Events
+              (SINTER sets)       (atomic deduct)  (async publish)
+                                                       │
+                                                       ▼
+                                                 Event Processor
+                                               (dedup → enrich → aggregate)
+                                                       │
+                                              ┌────────┼────────┐
+                                              ▼                 ▼
+                                        Redis Counters    PostgreSQL
+                                       (real-time stats) (historical reports)
+```
+
+### Ad Selection Pipeline (sub-ms p50)
+
+1. Parse request context (geo, category, device, user)
+2. Redis `SINTER` across targeting dimension sets → candidate ad IDs
+3. Fetch ad metadata (Caffeine L2 cache, 5s TTL)
+4. Double-check targeting criteria (index may be stale)
+5. Filter by budget availability (Redis read)
+6. Apply pacing multiplier (probabilistic throttle)
+7. Score & rank: `Ad Rank = bid × quality_score`
+8. Second-price auction: winner pays `(rank_2 / quality_1) + $0.01`
+9. Atomic budget deduction (Redis Lua script, single RTT)
+10. Publish impression event to Kafka (async, fire-and-forget)
+11. Return response with signed tracking URLs
+
+## Performance
+
+Tested with [k6](https://k6.io/) using `ramping-arrival-rate` ramping to **10,000 RPS** over 90 seconds, then sustaining peak load for 2 minutes.
+
+```bash
 k6 run load-test.js
 ```
 
 | Metric | Result |
 |--------|--------|
-| Total requests | 1,676,889 |
-| Throughput | ~7,000 RPS sustained |
-| p50 latency | 251µs |
-| p90 latency | 827µs |
-| p95 latency | 2ms |
-| p99 latency | 22.85ms |
-| Max latency | 204ms |
-| Error rate | 0.32% |
-| Max VUs used | 654 |
+| **Total requests** | 1,676,889 |
+| **Throughput** | ~7,000 RPS sustained |
+| **p50 latency** | 251µs |
+| **p90 latency** | 827µs |
+| **p95 latency** | 2ms |
+| **p99 latency** | 22.85ms |
+| **Max latency** | 204ms |
+| **Error rate** | 0.32% |
 
 All thresholds passed: p50 < 10ms, p95 < 50ms, p99 < 100ms, error rate < 1%.
 
 ## Tech Stack
 
-- **Java 21** / Spring Boot 3.3
-- **PostgreSQL 16** — campaign and ad metadata, reporting tables
-- **Redis 7** — ad index, budget counters (Lua scripts for atomicity), pacing state
-- **Kafka** — async event pipeline (impressions, clicks)
-- **Caffeine** — local ad metadata cache (5s TTL)
-- **Flyway** — schema migrations
-- **k6** — load testing
+| Component | Technology | Why |
+|-----------|-----------|-----|
+| Language | Java 21 | Virtual threads for high-concurrency |
+| Framework | Spring Boot 3.3 | Production-grade |
+| Message Queue | Apache Kafka | Event-driven processing |
+| Hot Cache | Redis | Sub-ms lookups, atomic budget ops |
+| Cold Storage | PostgreSQL | Campaigns, ads, reporting |
+| Build | Maven (multi-module) | Clean module boundaries |
+| Containers | Docker Compose | One-command local setup |
+| Load Testing | k6 | Prove performance claims |
+
+## Modules
+
+```
+ad-serving-system/
+├── ad-server-core/       # Domain models, ports/interfaces (zero infra deps)
+├── targeting-engine/     # Geo, device, contextual, daypart targeting
+├── budget-manager/       # Atomic budget deduction, pacing, daily reset
+├── event-processor/      # Kafka consumer, dedup, enrichment, reporting
+└── ad-server-api/        # REST API, Spring Boot app, adapters
+```
+
+## Key Design Decisions
+
+**Budget atomicity** — Single Redis Lua script checks both total and daily budget, deducts atomically. No overspend even under concurrent requests.
+
+**Charge at serve time** — Budget deducted when ad is selected, not on impression confirmation. Industry standard trade-off: slight overcharge is safer than overspend.
+
+**Pacing** — Proportional pacing (Twitter/X approach): divide day into 144 ten-minute slots, compare actual vs. expected spend, adjust serving probability. Multiplier clamped to [0.1, 3.0].
+
+**Event deduplication** — Redis `SETNX` with 24h TTL per event ID. Guarantees at-most-once processing.
+
+**Targeting index** — Redis sets per dimension (`geo:US`, `category:tech`, `device:MOBILE`), intersected with `SINTER`. Each set capped at 5K members.
+
+**Track tokens** — HMAC-SHA256 signed tokens containing `{ad_id, campaign_id, user_id, geo, timestamp, nonce}` for click/impression validation and fraud detection.
+
+## API Reference
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/ad` | GET | Ad selection (geo, category, device, user_id) |
+| `/v1/click` | GET | Click redirect (302) + event tracking |
+| `/v1/impression` | GET | Impression pixel + event tracking |
+| `/v1/events` | POST | Generic event ingestion (202 async) |
+| `/v1/reports/campaign/{id}/realtime` | GET | Real-time stats from Redis |
+| `/v1/reports/campaign/{id}` | GET | Historical stats (from, to, granularity) |
+
+## Data Model
+
+```sql
+campaigns    (id, name, advertiser_id, daily_budget_cents, total_budget_cents, status, dates)
+ad_groups    (id, campaign_id, targeting_criteria JSONB, bid_amount_cents, bid_type)
+ads          (id, ad_group_id, title, creative_url, click_url, status)
+hourly_stats (campaign_id, ad_id, hour, impressions, clicks, conversions, spend)
+daily_stats  (campaign_id, ad_id, date, impressions, clicks, conversions, spend, ctr)
+```
 
 ## Local Development
 
@@ -133,3 +162,14 @@ mvn test
 # Run load test (requires k6: brew install k6)
 k6 run load-test.js
 ```
+
+## Evolutionary Architecture
+
+Started as a modular monolith with clean port/adapter boundaries. Ready for microservice extraction:
+- Event Processor → separate Kafka consumer service
+- Auction Engine → gRPC service for sub-ms communication
+- Reporting → isolated from serving path
+
+## License
+
+MIT
